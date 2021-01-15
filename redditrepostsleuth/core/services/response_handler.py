@@ -1,8 +1,8 @@
 from time import perf_counter
 from typing import Text, NoReturn, Optional
 
-from praw.exceptions import APIException
-from praw.models import Comment, Redditor
+from praw.exceptions import APIException, RedditAPIException
+from praw.models import Comment, Redditor, Message
 from prawcore import Forbidden
 from sqlalchemy import func
 
@@ -75,7 +75,7 @@ class ResponseHandler:
         return Comment(self.reddit.reddit, id='1111')
 
 
-    def _reply_to_comment(self, comment_id: str, comment_body: str) -> Optional[Comment]:
+    def _reply_to_comment(self, comment_id: Text, comment_body: Text, subreddit: Text = None) -> Optional[Comment]:
         """
         Post a given reply to a given comment ID
         :rtype: Optional[Comment]
@@ -100,16 +100,19 @@ class ResponseHandler:
             return reply_comment
         except Forbidden:
             log.exception('Forbidden to respond to comment %s', comment_id, exc_info=False)
-            self._save_banned_sub(comment.subreddit.display_name)
+            # If we get Forbidden there's a chance we don't have hte comment data to get subreddit
+            if subreddit:
+                self._save_banned_sub(subreddit)
             raise
         except AssertionError:
             log.exception('Problem leaving comment', exc_info=True)
             raise
 
-    def reply_to_comment(self, comment_id: str, comment_body: str) -> Optional[Comment]:
+    def reply_to_comment(self, comment_id: Text, comment_body: Text, subreddit: Text = None) -> Optional[Comment]:
         if self.live_response:
-            return self._reply_to_comment(comment_id, comment_body)
+            return self._reply_to_comment(comment_id, comment_body, subreddit=subreddit)
         log.debug('Live response disabled')
+        # TODO - 1/12/2021 - Sketchy at best
         return Comment(self.reddit.reddit, id='1111')
 
     def _send_private_message(
@@ -138,22 +141,16 @@ class ResponseHandler:
             log.exception('Failed to send PM to %s', user.name, exc_info=True)
             raise
 
-        try:
-            with self.uowm.start() as uow:
-                uow.bot_private_message.add(
-                    BotPrivateMessage(
-                        subject=subject,
-                        body=message_body,
-                        in_response_to_post=post_id,
-                        in_response_to_comment=comment_id,
-                        triggered_from=source,
-                        recipient=user.name
-                    )
-                )
-                uow.commit()
-        except Exception as e:
-            # TODO - Get specific exc
-            log.exception('Failed to save private message to DB', exc_info=True)
+        self._save_private_message(
+            BotPrivateMessage(
+                subject=subject,
+                body=message_body,
+                in_response_to_post=post_id,
+                in_response_to_comment=comment_id,
+                triggered_from=source,
+                recipient=user.name
+            )
+        )
 
     def send_private_message(
             self,
@@ -169,6 +166,35 @@ class ResponseHandler:
             self._send_private_message(user, message_body, subject, source=source, post_id=post_id, comment_id=comment_id)
             return
         log.debug('Live resposne disabled')
+
+    def reply_to_private_message(self, message: Message, body: Text) -> NoReturn:
+        log.debug('Replying to private message from %s with subject %s', message.dest.name, message.subject)
+        try:
+            message.reply(body)
+            self._save_private_message(
+                BotPrivateMessage(
+                    subject=message.subject,
+                    body=body,
+                    triggered_from='inbox_reply',
+                    recipient=message.dest.name
+                )
+            )
+        except RedditAPIException:
+            log.exception('Problem replying to private message', exc_info=True)
+
+
+    def _save_private_message(self, bot_message: BotPrivateMessage) -> NoReturn:
+        """
+        Save a private message to the database
+        :param bot_message: BotMessage obj
+        """
+        try:
+            with self.uowm.start() as uow:
+                uow.bot_private_message.add(bot_message)
+                uow.commit()
+        except Exception as e:
+            # TODO - Get specific exc
+            log.exception('Failed to save private message to DB', exc_info=True)
 
     def _record_api_event(self, response_time, request_type, remaining_limit):
         api_event = RedditApiEvent(request_type, response_time, remaining_limit, event_type='api_response')
